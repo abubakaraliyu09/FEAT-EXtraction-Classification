@@ -1,0 +1,197 @@
+import os,cv2,time,argparse,warnings
+os.environ['IF_CPP_MIN_LOG_LEVEL'] = '2'
+import numpy as np,matplotlib.pyplot as plt
+from imutils import paths
+import seaborn as sns
+from joblib import dump
+import tensorflow as tf
+import pandas as pd
+from numpy import asarray, mean, squeeze
+from sklearn.metrics import precision_recall_fscore_support
+from sklearn.model_selection import GridSearchCV
+from keras.models import Model, load_model
+from sklearn.model_selection import train_test_split, KFold, cross_val_score,cross_val_predict
+from sklearn.metrics import confusion_matrix,classification_report, precision_score,recall_score,f1_score
+from sklearn.metrics import roc_curve, roc_auc_score
+from keras.preprocessing.image import img_to_array
+from sklearn.preprocessing import LabelEncoder
+from keras.applications.resnet import ResNet50
+from keras.applications.xception import Xception
+from sklearn.svm import SVC
+from keras.layers import BatchNormalization
+warnings.filterwarnings('ignore')
+
+data = []
+labels = []
+IMG_SIZE=299
+print("[INFO] loading images...")
+def load_data(DIR):
+    imagePaths = list(paths.list_images(DIR))
+    # loop over the image paths
+    for imagePath in imagePaths:
+        # extract the class label from the filename
+        label = imagePath.split(os.path.sep)[-2]
+        image = cv2.imread(imagePath)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = cv2.resize(image, (IMG_SIZE, IMG_SIZE))
+        # update the data and labels lists, respectively
+        data.append(image)
+        labels.append(label)
+    print('[INFO]', len(data), "Data Loaded Successfully!")
+    return data, labels
+
+
+def pre_trained_model():
+    print("[INFO] loading Pretrained Model...")
+    model = Xception(weights='imagenet')
+    model = Model(inputs=model.input, outputs=model.layers[-2].output)
+    for layer in model.layers:
+        if isinstance(layer, BatchNormalization):
+            layer.trainable = False
+        else:
+            layer.trainable = False
+    model.summary()
+    return model
+
+def extract_features():
+    model = pre_trained_model()
+    print("[INFO] Extracting Features...")
+    counter=0
+    features=[]
+    for point in data:
+        img=img_to_array(point)
+        img=np.expand_dims(img, axis=0)
+        feat=model.predict(img)
+        features.append(feat)
+        counter+=1
+        if counter%1==0:
+            print("[INFO]: Extracting features of image {}".format(counter),"out of", len(data), "images")
+    return features
+
+def pre_process():
+    features = extract_features()
+    X=np.array(features)
+    Y= np.array(labels)
+    #Reshape the features
+    X=X.reshape(X.shape[0], 1*1*2048)# ResNet50=2048
+    le=LabelEncoder()
+    Y=le.fit_transform(Y)
+    print("features.shape:",X.shape)
+    print("labels.shape:",Y.shape)
+    return  X,Y
+
+cross_val_scores=[]
+
+def classifier(X_train, X_validation, Y_train, Y_validation):
+    #Random Forest Regressor
+    model_type='Xception'
+    cls_type = 'SVM'
+
+    cls_model = SVC(kernel='linear', C=10.0, probability=True)
+
+    print('---------------------TRAINING-------------------------')
+    scores = cross_val_score(cls_model, X_train, Y_train, cv=10)
+    cross_val_scores.append(np.mean(scores))
+    cls_model.fit(X_train, Y_train)
+    #Confusion matrix for the training
+    scores_out = cls_model.predict(X_train)
+
+    #Training accuracy
+    per = mean(scores_out == Y_train)*100.0
+    print("Training accuracy- = %0.2f" %per)
+    #Performace matrices
+    tn, fp, fn, tp = confusion_matrix(Y_train, scores_out).ravel()
+    print('specificity = ', tn / (tn+fp))
+    print('Precision = ',precision_score(Y_train, scores_out))
+    print('Sensitivity = ',recall_score(Y_train, scores_out))
+    #ROC and AUC
+    auc_score=round(roc_auc_score(Y_train, scores_out),4)
+    tfpr, ttpr, thresholds = roc_curve(Y_train, scores_out)
+    #Confusion matrix
+    train_matrix=confusion_matrix(Y_train,scores_out)
+    groupNames=['True Negative','False Positive','False Negative','True Positive']
+    groupCount=["{}".format(value) for value in train_matrix.flatten()]
+    groupPer=["{0:.1%}".format(value) for value in train_matrix.flatten()/np.sum(train_matrix)]
+    lab=[f"{v1}\n{v2}\n{v3}" for v1,v2,v3 in zip(groupNames,groupCount,groupPer)]
+    lab=np.asarray(lab).reshape(2,2)
+    ax=sns.heatmap(train_matrix,annot=lab,fmt='',cmap='YlOrRd')
+    ax.set_xlabel('Predicted Values')
+    ax.set_ylabel('Actual Values ')
+    ax.xaxis.set_ticklabels(['False','True'])
+    ax.yaxis.set_ticklabels(['False','True'])
+    plt.title(str(cls_type) + ' train matrix')
+    strFile = "output/Train Matrix SVM.jpg"
+    if os.path.isfile(strFile):
+        os.remove(strFile)
+    plt.savefig(strFile)
+    plt.close()
+
+
+    print('---------------------TESTING-------------------------')
+    y_test_per = cls_model.predict(X_validation)
+    #Testing accuracy
+    per = mean(y_test_per == Y_validation)*100.0
+    print("Testing accuracy- = %0.2f" %per)
+    #Testing: performance metrics
+    tn, fp, fn, tp = confusion_matrix(Y_validation, y_test_per).ravel()
+    print('specificity = ', tn / (tn+fp))
+    print('Precision = ',precision_score(Y_validation, y_test_per))
+    print('Sensitivity = ',recall_score(Y_validation, y_test_per))
+    #ROC and AUC
+    auc_test=round(roc_auc_score(Y_validation, y_test_per),4)
+    fpr, tpr, thresholds = roc_curve(Y_validation, y_test_per)
+    #Confusion matrix
+    test_matrix=confusion_matrix(Y_validation,y_test_per)
+    groupNames=['True Negative','False Positive','False Negative','True Positive']
+    groupCount=["{}".format(value) for value in test_matrix.flatten()]
+    groupPer=["{0:.1%}".format(value) for value in test_matrix.flatten()/np.sum(test_matrix)]
+    lab=[f"{v1}\n{v2}\n{v3}" for v1,v2,v3 in zip(groupNames,groupCount,groupPer)]
+    lab=np.asarray(lab).reshape(2,2)
+    ax=sns.heatmap(test_matrix,annot=lab,fmt='',cmap='YlOrRd')
+    ax.set_xlabel('Predicted Values')
+    ax.set_ylabel('Actual Values ')
+    ax.xaxis.set_ticklabels(['False','True'])
+    ax.yaxis.set_ticklabels(['False','True'])
+    plt.title(str(cls_type) + ' test matrix')
+    strFile = "output/Test Matrix SVM.jpg"
+    if os.path.isfile(strFile):
+        os.remove(strFile)
+    plt.savefig(strFile)
+    plt.close()
+
+    #Save ROC Curve
+    random_auc=0.5
+    plt.plot([0, 1], [0, 1], 'k--', linewidth=1,label="Random Guess, AUC: "+str(random_auc))
+    plt.plot(tfpr, ttpr, linewidth=2,label=str(cls_type) + " Training AUC: "+str(auc_score))
+    plt.plot(fpr, tpr, linewidth=2,label=str(cls_type) + " Testing AUC: "+str(auc_test))
+    plt.xticks(np.arange(0.0, 1.1, step=0.1))
+    plt.title(str(model_type))
+    plt.xlabel('False Positive Rate')
+    plt.yticks(np.arange(0.0, 1.1, step=0.1))
+    plt.ylabel('True Positive Rate')
+    plt.legend(loc="lower right")
+    #save
+    strFile = "output/ROC.jpg"
+    if os.path.isfile(strFile):
+        os.remove(strFile)
+    plt.savefig(strFile)
+    plt.close()
+
+    return cls_model
+
+
+def main():
+    model_name = 'SPT-FT_SVM.pkl'
+    DIR = load_data('data')
+    X, Y = pre_process()
+    X_train, X_validation, Y_train, Y_validation = train_test_split(X, Y, test_size=0.2, random_state=0)
+    print('\nSplit data into train and validation')
+    print(X_train.shape, X_validation.shape)
+    # Build model
+    print('\n\nBuilding a model')
+    model = classifier(X_train, X_validation, Y_train, Y_validation)
+    dump(model, model_name)
+    return DIR,X,Y,X_train,Y_train,X_validation,Y_validation
+
+if __name__ == '__main__':
+    main()
